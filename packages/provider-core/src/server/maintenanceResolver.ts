@@ -386,6 +386,13 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   const commandPaths = [context.resolvedCommandPath, context.realCommandPath];
   const packageName = definition.npmPackageName;
 
+  const launcherScript = yield* readLauncherScript(context);
+  const app = appBundleManagingExecutable(context, launcherScript);
+  if (app) {
+    // The app ships its own updates, so there is no registry version to compare.
+    return { ...manual, managedBy: app, latestVersion: null };
+  }
+
   const nativeUpdate = definition.nativeUpdate;
   const native = nativeUpdate
     ? makeProviderMaintenanceCapabilities({
@@ -481,7 +488,7 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
     });
   }
 
-  if (commandPaths.some(isMiseCommandPath) || (yield* isMiseWrapperScript(context))) {
+  if (commandPaths.some(isMiseCommandPath) || isMiseWrapperScript(launcherScript)) {
     return manual;
   }
 
@@ -533,8 +540,12 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   return fallback;
 });
 
-/** A launcher script that runs the provider through mise (`exec mise x codex -- codex`). */
-const isMiseWrapperScript = Effect.fn("isMiseWrapperScript")(function* (
+const APP_BUNDLE_PATTERN = /\/([^/]+)\.app\/Contents\//i;
+const WRAPPER_EXEC_LINE_PATTERN = /\bexec\s/g;
+const WRAPPER_EXEC_TARGET_PATTERN = /\bexec\s+(?:"([^"]+)"|'([^']+)'|(\S+))/;
+
+/** The text of a small `#!` launcher script, or "" for a binary, a big file, or an unreadable one. */
+const readLauncherScript = Effect.fn("readLauncherScript")(function* (
   context: ProviderMaintenanceResolutionContext,
 ) {
   const fileSystem = yield* FileSystem.FileSystem;
@@ -543,13 +554,44 @@ const isMiseWrapperScript = Effect.fn("isMiseWrapperScript")(function* (
     Effect.orElseSucceed(() => Infinity),
   );
   if (size > MISE_WRAPPER_MAX_BYTES) {
-    return false;
+    return "";
   }
   const script = yield* fileSystem
     .readFileString(context.realCommandPath)
     .pipe(Effect.orElseSucceed(() => ""));
-  return script.startsWith("#!") && /\bmise\s+(?:x|exec)\b/.test(script);
+  return script.startsWith("#!") ? script : "";
 });
+
+/**
+ * The macOS app (`ChatGPT`) whose bundle holds the executable, found through
+ * the real path (symlinks) or a launcher script whose only `exec` goes into
+ * the bundle. The app updates it, so a package manager or `<cmd> update`
+ * cannot.
+ */
+function appBundleManagingExecutable(
+  context: ProviderMaintenanceResolutionContext,
+  launcherScript: string,
+): string | null {
+  if (context.platform !== "darwin") {
+    return null;
+  }
+  const fromPath = (value: string) => APP_BUNDLE_PATTERN.exec(value)?.[1];
+  const direct = fromPath(context.realCommandPath);
+  if (direct) {
+    return direct;
+  }
+  if ((launcherScript.match(WRAPPER_EXEC_LINE_PATTERN)?.length ?? 0) !== 1) {
+    return null;
+  }
+  const match = WRAPPER_EXEC_TARGET_PATTERN.exec(launcherScript);
+  const target = match?.[1] ?? match?.[2] ?? match?.[3];
+  return (target && fromPath(target)) ?? null;
+}
+
+/** A launcher script that runs the provider through mise (`exec mise x codex -- codex`). */
+function isMiseWrapperScript(launcherScript: string): boolean {
+  return /\bmise\s+(?:x|exec)\b/.test(launcherScript);
+}
 
 /**
  * Volta's `bin/<cmd>` is a link to its `volta-shim`, which picks the package
@@ -718,11 +760,16 @@ export function createProviderVersionAdvisory(input: {
   const capabilities =
     input.maintenanceCapabilities ?? makeManualProviderMaintenanceCapabilities(input.driver);
   const latestVersion = input.latestVersion ?? null;
-  const advisory = deriveVersionAdvisory({
-    currentVersion: input.currentVersion,
-    latestVersion,
-    ...(capabilities.compareVersions ? { compareVersions: capabilities.compareVersions } : {}),
-  });
+  const advisory = capabilities.managedBy
+    ? {
+        status: "unknown" as const,
+        message: `Updates with the ${capabilities.managedBy} app.`,
+      }
+    : deriveVersionAdvisory({
+        currentVersion: input.currentVersion,
+        latestVersion,
+        ...(capabilities.compareVersions ? { compareVersions: capabilities.compareVersions } : {}),
+      });
 
   return {
     status: advisory.status,
@@ -731,6 +778,7 @@ export function createProviderVersionAdvisory(input: {
     updateCommand: capabilities.update?.command ?? null,
     canUpdate: capabilities.update !== null,
     canInstallVersion: makeTargetedProviderUpdateAction(capabilities, "0.0.0") !== null,
+    ...(capabilities.managedBy ? { managedBy: capabilities.managedBy } : {}),
     checkedAt: input.checkedAt ?? null,
     message: advisory.message,
   };

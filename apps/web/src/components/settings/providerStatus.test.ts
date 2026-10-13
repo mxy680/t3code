@@ -156,3 +156,30 @@ describe("provider status copy", () => {
     });
   });
 });
+
+describe("getProviderVersionAdvisoryPresentation for app-managed installs", () => {
+  const managed = {
+    status: "unknown",
+    currentVersion: "0.162.0-alpha.17.2",
+    latestVersion: null,
+    updateCommand: null,
+    canUpdate: false,
+    managedBy: "ChatGPT",
+    checkedAt: null,
+    message: "Updates with the ChatGPT app.",
+  } as const;
+
+  it("shows no update badge when there is nothing to act on", () => {
+    expect(getProviderVersionAdvisoryPresentation(managed)).toBeNull();
+  });
+
+  it("still surfaces compatibility warnings", () => {
+    const presentation = getProviderVersionAdvisoryPresentation(managed, {
+      status: "broken",
+      message: "This version is known broken.",
+      latestVersionStatus: "unknown",
+    } as never);
+    expect(presentation?.title).toBe("Known broken version");
+    expect(presentation?.updateCommand).toBeNull();
+  });
+});

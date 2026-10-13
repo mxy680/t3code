@@ -55,6 +55,8 @@ export interface ProviderMaintenanceCommandResult {
   readonly timedOut: boolean;
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
+  /** Newest non-empty stderr line, else stdout's, read from the full untruncated stream. */
+  readonly failureReason?: string | null;
 }
 
 export interface ProviderMaintenanceRunnerShape {
@@ -150,14 +152,20 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
           );
         };
 
+        const stdoutTail = makeLastLineTracker();
+        const stderrTail = makeLastLineTracker();
         const [stdout, stderr, exitCode] = yield* Effect.all(
           [
             collectUint8StreamText({
-              stream: trackProgress(child.stdout),
+              stream: trackProgress(
+                child.stdout.pipe(Stream.tap((c) => Effect.sync(() => stdoutTail.push(c)))),
+              ),
               maxBytes: UPDATE_OUTPUT_MAX_BYTES,
             }),
             collectUint8StreamText({
-              stream: trackProgress(child.stderr),
+              stream: trackProgress(
+                child.stderr.pipe(Stream.tap((c) => Effect.sync(() => stderrTail.push(c)))),
+              ),
               maxBytes: UPDATE_OUTPUT_MAX_BYTES,
             }),
             child.exitCode,
@@ -180,6 +188,7 @@ const runProviderMaintenanceCommandWithSpawner = Effect.fn("ProviderMaintenanceR
           timedOut: false,
           stdoutTruncated: stdout.truncated,
           stderrTruncated: stderr.truncated,
+          failureReason: stderrTail.get() || stdoutTail.get() || null,
         } satisfies ProviderMaintenanceCommandResult;
       },
     );
@@ -251,12 +260,38 @@ function commandOutput(result: ProviderMaintenanceCommandResult): string | null 
   return truncateText(output, UPDATE_OUTPUT_MAX_BYTES);
 }
 
+// eslint-disable-next-line no-control-regex -- matching the ESC byte is the point
+const ANSI_PATTERN = /\u001b\[[0-9;?]*[ -/]*[@-~]/g;
+const FAILURE_REASON_MAX_LENGTH = 200;
+
+/** Tracks the newest non-empty line of a stream without keeping the stream. */
+function makeLastLineTracker() {
+  const decoder = new TextDecoder();
+  let partial = "";
+  let last = "";
+  const clean = (line: string) => line.replace(ANSI_PATTERN, "").trim();
+  return {
+    push(chunk: Uint8Array) {
+      const parts = (partial + decoder.decode(chunk, { stream: true })).split(/\r\n|\n|\r/);
+      partial = parts.pop()!.slice(-1_000);
+      for (const part of parts) {
+        const line = clean(part);
+        if (line) last = line;
+      }
+    },
+    get: () => clean(partial) || last,
+  };
+}
+
 function failureMessage(result: ProviderMaintenanceCommandResult): string {
   if (result.timedOut) {
     return "Update timed out.";
   }
   if (result.exitCode !== null && result.exitCode !== 0) {
-    return `Update command exited with code ${result.exitCode}.`;
+    const reason = result.failureReason
+      ? `: ${truncateText(result.failureReason, FAILURE_REASON_MAX_LENGTH)}`
+      : ".";
+    return `Update command exited with code ${result.exitCode}${reason}`;
   }
   return "Update command failed.";
 }

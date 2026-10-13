@@ -676,7 +676,10 @@ describe("providerMaintenanceRunner", () => {
       const updateState = result.providers[0]?.updateState;
 
       assert.strictEqual(updateState?.status, "failed");
-      assert.strictEqual(updateState?.message, "Update command exited with code 1.");
+      assert.strictEqual(
+        updateState?.message,
+        "Update command exited with code 1: permission denied",
+      );
       assert.include(updateState?.output ?? "", "permission denied");
     }).pipe(
       Effect.provide(
@@ -684,6 +687,33 @@ describe("providerMaintenanceRunner", () => {
           layerNonWindowsPlatform,
           layerLatestVersionHttpClient("0.0.0"),
           layerMockSpawner(() => ({ stderr: "permission denied", code: 1 })),
+        ),
+      ),
+    ),
+  );
+
+  it.effect("reports the last stderr line, past the output cap, without ANSI codes", () =>
+    Effect.gen(function* () {
+      const { registry } = yield* makeRegistry();
+      const updater = yield* makeTestRunner(registry);
+
+      const result = yield* updater.updateProvider(CODEX_DRIVER);
+      const updateState = result.providers[0]?.updateState;
+
+      assert.strictEqual(
+        updateState?.message,
+        "Update command exited with code 1: EACCES: permission denied",
+      );
+    }).pipe(
+      Effect.provide(
+        Layer.mergeAll(
+          layerNonWindowsPlatform,
+          layerLatestVersionHttpClient("0.0.0"),
+          layerMockSpawner(() => ({
+            stdout: "stdout noise\nnot the reason",
+            stderr: `${"x".repeat(20_000)}\nnpm ERR! start\r\n\u001b[31mEACCES: permission denied\u001b[0m\r\n\n`,
+            code: 1,
+          })),
         ),
       ),
     ),

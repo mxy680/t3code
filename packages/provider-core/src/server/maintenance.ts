@@ -4,6 +4,8 @@ export interface ProviderMaintenanceCapabilities {
   readonly provider: ProviderDriverKind;
   readonly packageName: string | null;
   readonly update: ProviderMaintenanceCommandAction | null;
+  /** App that ships and updates this executable (e.g. "ChatGPT"); T3 Code never updates it. */
+  readonly managedBy?: string;
   /**
    * Latest version reported by the installer that owns the executable.
    * `undefined` means the installer has no channel of its own and the npm

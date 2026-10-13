@@ -797,6 +797,99 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       }),
   );
 
+  it.effect.skipIf(windowsHost)(
+    "leaves executables bundled in a macOS app to that app, via wrapper script or symlink",
+    () =>
+      Effect.gen(function* () {
+        const tempDir = yield* makeTempDir("t3-app-bundled-capabilities");
+        const selfUpdating = makePackageManagedProviderMaintenanceResolver({
+          provider: driver("packageTool"),
+          npmPackageName: "@example/package-tool",
+          nativeUpdate: { args: ["update"] },
+        });
+        const resolveAs = (binaryPath: string, platform: NodeJS.Platform = "darwin") =>
+          selfUpdating
+            .resolve({
+              binaryPath,
+              resolvedCommandPath: binaryPath,
+              realCommandPath: NodeFS.realpathSync(binaryPath),
+              env: { PATH: "" },
+              platform,
+            })
+            .pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn));
+        const writeScript = (name: string, body: string) => {
+          const path = NodePath.join(tempDir, "bin", name);
+          NodeFS.mkdirSync(NodePath.dirname(path), { recursive: true });
+          NodeFS.writeFileSync(path, `#!/bin/bash\n${body}\n`);
+          NodeFS.chmodSync(path, 0o755);
+          return path;
+        };
+        const bundled = NodePath.join(
+          tempDir,
+          "Applications",
+          "ChatGPT.app",
+          "Contents",
+          "Resources",
+          "bin",
+          "package-tool",
+        );
+        writeExecutable(bundled);
+        const spaced = NodePath.join(
+          tempDir,
+          "My Apps",
+          "Chat GPT.app",
+          "Contents",
+          "package-tool",
+        );
+        writeExecutable(spaced);
+
+        const wrapper = writeScript("plain", `# bundled\nexec "${bundled}" "$@"`);
+        const spacedWrapper = writeScript("spaced", `exec "${spaced}" "$@"`);
+        const twoExecs = writeScript(
+          "two",
+          `if [ -n "$X" ]; then exec other; fi\nexec "${bundled}" "$@"`,
+        );
+        const noContents = NodePath.join(tempDir, "Tools", "Thing.app", "bin", "package-tool");
+        writeExecutable(noContents);
+
+        const managed = [wrapper];
+        if (symlinksSupported) {
+          const link = NodePath.join(tempDir, "linked", "package-tool");
+          NodeFS.mkdirSync(NodePath.dirname(link), { recursive: true });
+          NodeFS.symlinkSync(bundled, link);
+          managed.push(link);
+        }
+        for (const binaryPath of managed) {
+          const capabilities = yield* resolveAs(binaryPath);
+          expect(capabilities.update).toBeNull();
+          expect(capabilities.managedBy).toBe("ChatGPT");
+          expect(capabilities.latestVersion).toBeNull();
+
+          const advisory = createProviderVersionAdvisory({
+            driver: driver("packageTool"),
+            currentVersion: "0.162.0-alpha.17.2",
+            latestVersion: "0.162.1",
+            maintenanceCapabilities: capabilities,
+          });
+          expect(advisory).toMatchObject({
+            status: "unknown",
+            canUpdate: false,
+            updateCommand: null,
+            managedBy: "ChatGPT",
+            message: "Updates with the ChatGPT app.",
+          });
+        }
+
+        // A quoted exec target may contain spaces.
+        expect((yield* resolveAs(spacedWrapper)).managedBy).toBe("Chat GPT");
+        // Only macOS bundles count, and only real `X.app/Contents/` ones.
+        expect((yield* resolveAs(wrapper, "linux")).managedBy).toBeUndefined();
+        expect((yield* resolveAs(noContents)).managedBy).toBeUndefined();
+        // A script with more than one exec is not classified.
+        expect((yield* resolveAs(twoExecs)).managedBy).toBeUndefined();
+      }),
+  );
+
   it.effect.skipIf(!symlinksSupported)("updates Yarn global installs with yarn", () =>
     Effect.gen(function* () {
       const tempDir = yield* makeTempDir("t3-yarn-capabilities");
