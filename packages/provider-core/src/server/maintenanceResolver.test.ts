@@ -797,6 +797,61 @@ it.layer(NodeServices.layer)("providerMaintenance", (it) => {
       }),
   );
 
+  it.effect.skipIf(windowsHost)(
+    "leaves executables bundled in an app to that app, via wrapper script or symlink",
+    () =>
+      Effect.gen(function* () {
+        const tempDir = yield* makeTempDir("t3-app-bundled-capabilities");
+        const selfUpdating = makePackageManagedProviderMaintenanceResolver({
+          provider: driver("packageTool"),
+          npmPackageName: "@example/package-tool",
+          nativeUpdate: { args: ["update"] },
+        });
+        const bundled = NodePath.join(
+          tempDir,
+          "Applications",
+          "ChatGPT.app",
+          "Contents",
+          "Resources",
+          "bin",
+          "package-tool",
+        );
+        writeExecutable(bundled);
+
+        const wrapper = NodePath.join(tempDir, "bin", "package-tool");
+        NodeFS.mkdirSync(NodePath.dirname(wrapper), { recursive: true });
+        NodeFS.writeFileSync(wrapper, `#!/bin/bash\n# bundled\nexec "${bundled}" "$@"\n`);
+        NodeFS.chmodSync(wrapper, 0o755);
+
+        const link = NodePath.join(tempDir, "linked", "package-tool");
+        NodeFS.mkdirSync(NodePath.dirname(link), { recursive: true });
+        if (symlinksSupported) NodeFS.symlinkSync(bundled, link);
+
+        for (const binaryPath of symlinksSupported ? [wrapper, link] : [wrapper]) {
+          const capabilities = yield* resolveProviderMaintenanceCapabilitiesEffect(selfUpdating, {
+            binaryPath,
+            env: { PATH: "" },
+          }).pipe(Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, noSpawn));
+          expect(capabilities.update).toBeNull();
+          expect(capabilities.managedBy).toBe("ChatGPT");
+
+          const advisory = createProviderVersionAdvisory({
+            driver: driver("packageTool"),
+            currentVersion: "0.162.0-alpha.17.2",
+            latestVersion: "0.162.1",
+            maintenanceCapabilities: capabilities,
+          });
+          expect(advisory).toMatchObject({
+            status: "unknown",
+            canUpdate: false,
+            updateCommand: null,
+            managedBy: "ChatGPT",
+            message: "Updates with the ChatGPT app.",
+          });
+        }
+      }),
+  );
+
   it.effect.skipIf(!symlinksSupported)("updates Yarn global installs with yarn", () =>
     Effect.gen(function* () {
       const tempDir = yield* makeTempDir("t3-yarn-capabilities");

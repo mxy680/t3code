@@ -676,7 +676,10 @@ describe("providerMaintenanceRunner", () => {
       const updateState = result.providers[0]?.updateState;
 
       assert.strictEqual(updateState?.status, "failed");
-      assert.strictEqual(updateState?.message, "Update command exited with code 1.");
+      assert.strictEqual(
+        updateState?.message,
+        "Update command exited with code 1: permission denied",
+      );
       assert.include(updateState?.output ?? "", "permission denied");
     }).pipe(
       Effect.provide(

@@ -386,6 +386,11 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   const commandPaths = [context.resolvedCommandPath, context.realCommandPath];
   const packageName = definition.npmPackageName;
 
+  const app = yield* appBundleManagingExecutable(context);
+  if (app) {
+    return { ...manual, managedBy: app };
+  }
+
   const nativeUpdate = definition.nativeUpdate;
   const native = nativeUpdate
     ? makeProviderMaintenanceCapabilities({
@@ -531,6 +536,37 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   }
 
   return fallback;
+});
+
+const APP_BUNDLE_PATTERN = /\/([^/]+)\.app\//i;
+const APP_WRAPPER_EXEC_PATTERN = /^\s*exec\s+(?:-a\s+\S+\s+)?["']?([^"'\s]+\.app\/[^"'\s]*)/im;
+
+/**
+ * The app (`ChatGPT`) whose bundle holds the executable, found through the
+ * real path (symlinks) or a small launcher script that `exec`s into the
+ * bundle. The app updates it, so a package manager or `<cmd> update` cannot.
+ */
+const appBundleManagingExecutable = Effect.fn("appBundleManagingExecutable")(function* (
+  context: ProviderMaintenanceResolutionContext,
+) {
+  const fromPath = (value: string) => APP_BUNDLE_PATTERN.exec(value.replaceAll("\\", "/"))?.[1];
+  const direct = fromPath(context.realCommandPath) ?? fromPath(context.resolvedCommandPath);
+  if (direct) {
+    return direct;
+  }
+  const fileSystem = yield* FileSystem.FileSystem;
+  const size = yield* fileSystem.stat(context.realCommandPath).pipe(
+    Effect.map((info) => Number(info.size)),
+    Effect.orElseSucceed(() => Infinity),
+  );
+  if (size > MISE_WRAPPER_MAX_BYTES) {
+    return null;
+  }
+  const script = yield* fileSystem
+    .readFileString(context.realCommandPath)
+    .pipe(Effect.orElseSucceed(() => ""));
+  const target = script.startsWith("#!") ? APP_WRAPPER_EXEC_PATTERN.exec(script)?.[1] : undefined;
+  return (target && fromPath(target)) ?? null;
 });
 
 /** A launcher script that runs the provider through mise (`exec mise x codex -- codex`). */
@@ -718,11 +754,16 @@ export function createProviderVersionAdvisory(input: {
   const capabilities =
     input.maintenanceCapabilities ?? makeManualProviderMaintenanceCapabilities(input.driver);
   const latestVersion = input.latestVersion ?? null;
-  const advisory = deriveVersionAdvisory({
-    currentVersion: input.currentVersion,
-    latestVersion,
-    ...(capabilities.compareVersions ? { compareVersions: capabilities.compareVersions } : {}),
-  });
+  const advisory = capabilities.managedBy
+    ? {
+        status: "unknown" as const,
+        message: `Updates with the ${capabilities.managedBy} app.`,
+      }
+    : deriveVersionAdvisory({
+        currentVersion: input.currentVersion,
+        latestVersion,
+        ...(capabilities.compareVersions ? { compareVersions: capabilities.compareVersions } : {}),
+      });
 
   return {
     status: advisory.status,
@@ -731,6 +772,7 @@ export function createProviderVersionAdvisory(input: {
     updateCommand: capabilities.update?.command ?? null,
     canUpdate: capabilities.update !== null,
     canInstallVersion: makeTargetedProviderUpdateAction(capabilities, "0.0.0") !== null,
+    ...(capabilities.managedBy ? { managedBy: capabilities.managedBy } : {}),
     checkedAt: input.checkedAt ?? null,
     message: advisory.message,
   };

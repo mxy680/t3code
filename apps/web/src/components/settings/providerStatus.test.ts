@@ -156,3 +156,20 @@ describe("provider status copy", () => {
     });
   });
 });
+
+describe("getProviderVersionAdvisoryPresentation for app-managed installs", () => {
+  it("explains the app updates it and offers no command", () => {
+    const presentation = getProviderVersionAdvisoryPresentation({
+      status: "unknown",
+      currentVersion: "0.162.0-alpha.17.2",
+      latestVersion: "0.162.1",
+      updateCommand: null,
+      canUpdate: false,
+      managedBy: "ChatGPT",
+      checkedAt: null,
+      message: "Updates with the ChatGPT app.",
+    });
+    expect(presentation?.title).toBe("Updates with the ChatGPT app");
+    expect(presentation?.updateCommand).toBeNull();
+  });
+});

@@ -122,6 +122,15 @@ export function getProviderVersionAdvisoryPresentation(
   readonly emphasis: "normal" | "strong";
   readonly targetVersion: string | null;
 } | null {
+  if (advisory?.managedBy) {
+    return {
+      title: `Updates with the ${advisory.managedBy} app`,
+      detail: `This copy is bundled with the ${advisory.managedBy} app, so update it there.`,
+      updateCommand: null,
+      emphasis: "normal",
+      targetVersion: null,
+    };
+  }
   const latestIsIncompatible =
     compatibility?.latestVersionStatus === "broken" ||
     compatibility?.latestVersionStatus === "unsupported";

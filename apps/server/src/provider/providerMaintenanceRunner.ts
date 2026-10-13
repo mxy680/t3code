@@ -256,7 +256,11 @@ function failureMessage(result: ProviderMaintenanceCommandResult): string {
     return "Update timed out.";
   }
   if (result.exitCode !== null && result.exitCode !== 0) {
-    return `Update command exited with code ${result.exitCode}.`;
+    const lastLine = commandOutput(result)
+      ?.split("\n")
+      .findLast((line) => line.trim() !== "");
+    const reason = lastLine ? `: ${truncateText(lastLine.trim(), 200)}` : ".";
+    return `Update command exited with code ${result.exitCode}${reason}`;
   }
   return "Update command failed.";
 }
