@@ -2334,6 +2334,27 @@ it.layer(
     ),
   );
 
+  it.effect("resolves a cswap account the server discovered", () =>
+    Effect.gen(function* () {
+      const path = yield* Path.Path;
+      const serverSettings = yield* ServerSettings.ServerSettingsService;
+      const environment = yield* TerminalManager.resolveProviderInstanceTerminalEnvironment({
+        serverSettings,
+        path,
+        rawProviderInstanceId: "claude_cswap_3",
+        env: undefined,
+        discoveredInstances: {
+          claude_cswap_3: {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            config: { homePath: "/profiles/3" },
+          },
+        },
+      });
+
+      expect(environment.CLAUDE_CONFIG_DIR).toBe(path.resolve("/profiles/3"));
+    }).pipe(Effect.provide(ServerSettings.layerTest({}))),
+  );
+
   it.effect("resolves the Codex default slot", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;

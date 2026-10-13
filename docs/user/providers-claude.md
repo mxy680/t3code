@@ -30,9 +30,25 @@ location intact. Use the same variable for the login command. Setting `HOME`
 instead can put credentials where this provider will not find them.
 
 Check the account reported in provider settings after signing in. Existing
-threads can switch only between Claude instances with the same config directory.
+threads can switch only between Claude instances that keep conversations in the
+same place: the same config directory, or one whose `projects` folder links to it.
 Separate account directories stay isolated, including their local conversation
 state. Claude does not have Codex's shared-home and shadow-home arrangement.
+
+## Several accounts with cswap
+
+If the [cswap](https://github.com/realiti4/claude-swap) account switcher is
+installed on the environment's machine, each cswap account appears as its own
+Claude provider in the model picker, named by its cswap alias or email. Hover an
+account to see how much of its session and weekly limits is left. Pick one per
+thread; the default **Claude** provider keeps using cswap's current login.
+
+cswap accounts share one conversation history, so a thread can move between
+them and keep its context. When a thread's account reaches a usage limit, T3
+Code moves it to the enabled cswap account with the most usage left and
+continues the turn, and the thread says which account took over. Accounts you
+`cswap disable` are never chosen automatically. When no account has usage left,
+the thread waits for the reset as usual.
 
 For presets that differ only in API keys or endpoints, use the instance's
 **Environment variables**. Variable assignments do not belong in **Launch arguments**.

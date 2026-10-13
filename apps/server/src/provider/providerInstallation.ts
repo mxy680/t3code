@@ -9,10 +9,12 @@ import {
 } from "@t3tools/contracts";
 import { resolveCommandPath } from "@t3tools/shared/shell";
 import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 
 import * as CodexInstallation from "./CodexInstallation.ts";
+import * as CswapDiscovery from "./CswapDiscovery.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as AntigravityInstallation from "./AntigravityInstallation.ts";
 import { deriveProviderInstanceConfigMap } from "./ProviderInstanceRegistryHydration.ts";
@@ -32,6 +34,7 @@ export const makeProviderInstallation = Effect.fn("makeProviderInstallation")(fu
   const instances = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
   const providers = yield* ProviderRegistry.ProviderRegistry;
   const settings = yield* ServerSettings.ServerSettingsService;
+  const cswapDiscovery = yield* Effect.serviceOption(CswapDiscovery.CswapDiscovery);
 
   const readEntries = Effect.fn("ProviderInstallation.readEntries")(function* (
     instanceId: ProviderInstanceId,
@@ -47,7 +50,8 @@ export const makeProviderInstallation = Effect.fn("makeProviderInstallation")(fu
           }),
       ),
     );
-    return deriveProviderInstanceConfigMap(current);
+    const discovered = Option.isSome(cswapDiscovery) ? yield* cswapDiscovery.value.instances : {};
+    return deriveProviderInstanceConfigMap(current, discovered);
   });
 
   const requireInstance = Effect.fn("ProviderInstallation.requireInstance")(function* (
