@@ -58,7 +58,10 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
  * Instances can resume each other's sessions when Claude keeps their
  * transcripts in the same place. A config directory whose `projects` folder
  * links into another one (as `cswap run --share-history` profiles link into
- * `~/.claude`) therefore joins that directory's group.
+ * `~/.claude`) therefore joins the group of the directory that really holds
+ * the transcripts. A default `~/.claude` that is itself a link keeps its
+ * unresolved key, so linked profiles resume its threads through a handoff
+ * instead of natively.
  */
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
   function* (
@@ -69,8 +72,10 @@ export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationG
     const fileSystem = yield* FileSystem.FileSystem;
     const resolvedHomePath = yield* resolveClaudeHomePath(config, environment);
     const projectsPath = path.join(resolvedHomePath, "projects");
+    // Only a linked `projects` folder changes the key, so every existing
+    // instance keeps the key it already had. Links are followed to the end.
     const linkedProjects = yield* fileSystem.readLink(projectsPath).pipe(
-      Effect.map((target) => path.resolve(resolvedHomePath, target)),
+      Effect.andThen(fileSystem.realPath(projectsPath)),
       Effect.orElseSucceed(() => undefined),
     );
     const transcriptHome =

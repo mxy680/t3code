@@ -10,13 +10,15 @@
  * each account becomes an ordinary Claude provider instance. Nothing here
  * reads or copies credentials; cswap owns them.
  *
- * Every function degrades to "no accounts" when cswap is missing or fails,
- * which leaves Claude exactly as it was.
+ * Without cswap there are no accounts, which leaves Claude exactly as it
+ * was. A failed listing is reported as such so callers keep what they had.
  *
  * @module provider/cswapAccounts
  */
 import {
   CSWAP_PROVIDER_INSTANCE_PREFIX,
+  defaultInstanceIdForDriver,
+  type ModelSelection,
   ProviderDriverKind,
   ProviderInstanceId,
   type ProviderInstanceConfig,
@@ -29,28 +31,31 @@ import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 import { ChildProcess, ChildProcessSpawner } from "effect/process";
 import * as HostProcess from "@t3tools/shared/HostProcess";
-import { collectStreamAsString } from "@t3tools/provider-core/server/snapshotProbe";
+import {
+  collectStreamAsString,
+  isCommandMissingCause,
+} from "@t3tools/provider-core/server/snapshotProbe";
 
 const CSWAP_COMMAND = "cswap";
 const CSWAP_TIMEOUT = Duration.seconds(20);
-const CSWAP_INSTANCE_PREFIX = CSWAP_PROVIDER_INSTANCE_PREFIX;
 const CONFIG_DIR_MARKER = "T3_CSWAP_CONFIG_DIR=";
 const PRINT_CONFIG_DIR_FLAG = "--t3-cswap-print-config-dir";
 
-export interface CswapAccount {
-  readonly number: number;
-  readonly email: string;
+export const CswapAccount = Schema.Struct({
+  number: Schema.Number,
+  email: Schema.String,
   /** The alias the user gave the account in cswap, else its email. */
-  readonly label: string;
+  label: Schema.String,
   /** The account Claude's default login (`~/.claude`) currently uses. */
-  readonly active: boolean;
+  active: Schema.Boolean,
   /** Held out of cswap's automatic rotation. */
-  readonly disabled: boolean;
+  disabled: Schema.Boolean,
   /** `ok` when cswap could read the account's usage. */
-  readonly usageStatus: string;
-  readonly fiveHourPercent: number | null;
-  readonly sevenDayPercent: number | null;
-}
+  usageStatus: Schema.String,
+  fiveHourPercent: Schema.NullOr(Schema.Number),
+  sevenDayPercent: Schema.NullOr(Schema.Number),
+});
+export type CswapAccount = typeof CswapAccount.Type;
 
 const UsageWindowJson = Schema.Struct({ pct: Schema.optional(Schema.NullOr(Schema.Number)) });
 const CswapListJson = Schema.Struct({
@@ -75,10 +80,10 @@ const CswapListJson = Schema.Struct({
 });
 const decodeCswapList = Schema.decodeUnknownOption(Schema.fromJsonString(CswapListJson));
 
-/** Accounts from `cswap list --json`; anything unreadable yields none. */
-export function parseCswapAccountList(stdout: string): ReadonlyArray<CswapAccount> {
+/** Accounts from `cswap list --json`, or null when the output is unreadable. */
+export function parseCswapAccountList(stdout: string): ReadonlyArray<CswapAccount> | null {
   const decoded = decodeCswapList(stdout.trim());
-  if (Option.isNone(decoded)) return [];
+  if (Option.isNone(decoded)) return null;
   return decoded.value.accounts
     .filter((account) => Number.isInteger(account.number) && account.number > 0)
     .map((account) => ({
@@ -94,13 +99,40 @@ export function parseCswapAccountList(stdout: string): ReadonlyArray<CswapAccoun
 }
 
 export const cswapInstanceId = (accountNumber: number): ProviderInstanceId =>
-  ProviderInstanceId.make(`${CSWAP_INSTANCE_PREFIX}${accountNumber}`);
+  ProviderInstanceId.make(`${CSWAP_PROVIDER_INSTANCE_PREFIX}${accountNumber}`);
 
 /** The cswap account an instance id was derived for, if it was. */
 export function cswapAccountNumberFromInstanceId(instanceId: string): number | null {
-  if (!instanceId.startsWith(CSWAP_INSTANCE_PREFIX)) return null;
-  const parsed = Number(instanceId.slice(CSWAP_INSTANCE_PREFIX.length));
+  if (!instanceId.startsWith(CSWAP_PROVIDER_INSTANCE_PREFIX)) return null;
+  const parsed = Number(instanceId.slice(CSWAP_PROVIDER_INSTANCE_PREFIX.length));
   return Number.isInteger(parsed) && parsed > 0 ? parsed : null;
+}
+
+/**
+ * Send a command aimed at a cswap account this server does not run (removed
+ * from cswap, or cswap gone) to the default Claude instance instead, so the
+ * thread keeps working on Claude's default login.
+ */
+export function routeUndiscoveredCswapInstance<C extends object>(
+  command: C,
+  isRunning: (instanceId: ProviderInstanceId) => boolean,
+): C {
+  if (!("modelSelection" in command)) return command;
+  const selection = command.modelSelection as ModelSelection | undefined;
+  if (
+    selection === undefined ||
+    cswapAccountNumberFromInstanceId(selection.instanceId) === null ||
+    isRunning(selection.instanceId)
+  ) {
+    return command;
+  }
+  return {
+    ...command,
+    modelSelection: {
+      ...selection,
+      instanceId: defaultInstanceIdForDriver(ProviderDriverKind.make("claudeAgent")),
+    },
+  };
 }
 
 /** Whether cswap reports headroom on every window it knows about. */
@@ -137,15 +169,22 @@ export function chooseCswapFallbackAccount(input: {
  * One Claude provider instance per cswap account. `configDirs` maps an
  * account to its prepared profile; `null` means the default login.
  * Accounts whose profile could not be prepared are left out.
+ *
+ * The default login runs with no `CLAUDE_CONFIG_DIR`. When the server itself
+ * inherited one, that account is left out: the inherited directory belongs
+ * to another login, and exporting `~/.claude` explicitly would make Claude
+ * look for a differently named keychain entry and report signed out.
  */
 export function cswapProviderInstances(
   accounts: ReadonlyArray<CswapAccount>,
   configDirs: ReadonlyMap<number, string | null>,
+  inheritedConfigDir?: string,
 ): Record<string, ProviderInstanceConfig> {
   const instances: Record<string, ProviderInstanceConfig> = {};
+  const inheritsConfigDir = (inheritedConfigDir?.trim() ?? "").length > 0;
   for (const account of accounts) {
     const configDir = configDirs.get(account.number);
-    if (configDir === undefined) continue;
+    if (configDir === undefined || (configDir === null && inheritsConfigDir)) continue;
     instances[cswapInstanceId(account.number)] = {
       driver: ProviderDriverKind.make("claudeAgent"),
       displayName: account.label,
@@ -155,7 +194,21 @@ export function cswapProviderInstances(
   return instances;
 }
 
-const runCswap = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv) =>
+/** `missing` means cswap is not installed; `failed` covers timeouts, errors, and unreadable output. */
+export type CswapListing =
+  | { readonly _tag: "ok"; readonly accounts: ReadonlyArray<CswapAccount> }
+  | { readonly _tag: "missing" }
+  | { readonly _tag: "failed" };
+
+type CswapRun =
+  | { readonly _tag: "ok"; readonly stdout: string }
+  | { readonly _tag: "missing" }
+  | { readonly _tag: "failed" };
+
+const runCswap = (
+  args: ReadonlyArray<string>,
+  env: NodeJS.ProcessEnv,
+): Effect.Effect<CswapRun, never, ChildProcessSpawner.ChildProcessSpawner> =>
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner.ChildProcessSpawner;
     const child = yield* spawner.spawn(
@@ -165,21 +218,29 @@ const runCswap = (args: ReadonlyArray<string>, env: NodeJS.ProcessEnv) =>
       [collectStreamAsString(child.stdout), child.exitCode],
       { concurrency: "unbounded" },
     );
-    return Number(exitCode) === 0 ? Option.some(stdout) : Option.none<string>();
+    const result: CswapRun = Number(exitCode) === 0 ? { _tag: "ok", stdout } : { _tag: "failed" };
+    return result;
   }).pipe(
     Effect.scoped,
     Effect.timeoutOption(CSWAP_TIMEOUT),
-    Effect.map(Option.flatten),
-    Effect.orElseSucceed(() => Option.none<string>()),
+    Effect.map(Option.getOrElse((): CswapRun => ({ _tag: "failed" }))),
+    Effect.catch((cause) =>
+      Effect.succeed<CswapRun>(
+        isCommandMissingCause(cause) ? { _tag: "missing" } : { _tag: "failed" },
+      ),
+    ),
   );
 
-/** cswap's account list, or none when cswap is not installed or not usable here. */
+/** cswap's account list. On Windows, where cswap profiles are unsupported, cswap counts as missing. */
 export const listCswapAccounts = Effect.fn("listCswapAccounts")(function* () {
   // `cswap run` profiles share history through symlinks, which cswap only supports on POSIX.
-  if ((yield* HostProcess.Platform) === "win32") return [];
+  if ((yield* HostProcess.Platform) === "win32") return { _tag: "missing" } as CswapListing;
   const env = yield* HostProcess.Environment;
-  const stdout = yield* runCswap(["list", "--json"], env);
-  return Option.match(stdout, { onNone: () => [], onSome: parseCswapAccountList });
+  const result = yield* runCswap(["list", "--json"], env);
+  if (result._tag !== "ok") return result as CswapListing;
+  const accounts = parseCswapAccountList(result.stdout);
+  const listing: CswapListing = accounts === null ? { _tag: "failed" } : { _tag: "ok", accounts };
+  return listing;
 });
 
 /**
@@ -218,7 +279,7 @@ export const resolveCswapConfigDir = Effect.fn("resolveCswapConfigDir")(function
     const originalPath = env.PATH ?? "";
     // An inherited CLAUDE_CONFIG_DIR would stop cswap from recognising the default login.
     const { CLAUDE_CONFIG_DIR: _inherited, ...baseEnv } = env;
-    const stdout = yield* runCswap(
+    const result = yield* runCswap(
       ["run", String(accountNumber), "--share-history", "--", PRINT_CONFIG_DIR_FLAG],
       {
         ...baseEnv,
@@ -227,10 +288,7 @@ export const resolveCswapConfigDir = Effect.fn("resolveCswapConfigDir")(function
         T3_CSWAP_ORIGINAL_PATH: originalPath,
       },
     );
-    return Option.match(stdout, {
-      onNone: () => undefined,
-      onSome: parseCswapConfigDirOutput,
-    });
+    return result._tag === "ok" ? parseCswapConfigDirOutput(result.stdout) : undefined;
   }).pipe(
     Effect.scoped,
     Effect.orElseSucceed(() => undefined),

@@ -3,7 +3,8 @@
  * usage limit, so the work continues instead of waiting for the reset.
  *
  * Claude reports a reached limit either by pausing the turn (a `usage-limit:`
- * system notice) or by failing it with a `usage_limit` error. Either one on
+ * system notice) or by failing it with a `usage_limit` error, checked again
+ * when the run itself fails because the two commit separately. Either one on
  * the thread's current attempt restarts or continues the run on the account
  * with the most headroom, through the same `message.dispatch` a user's model
  * switch uses. cswap profiles share Claude's transcripts, so the other account
@@ -23,6 +24,7 @@ import {
   type OrchestrationV2Run,
   type OrchestrationV2TurnItem,
   type ProviderInstanceId,
+  type RunId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 import * as Effect from "effect/Effect";
@@ -33,9 +35,9 @@ import {
   chooseCswapFallbackAccount,
   cswapAccountNumberFromInstanceId,
   cswapInstanceId,
-  listCswapAccounts,
   type CswapAccount,
 } from "../provider/cswapAccounts.ts";
+import * as CswapDiscovery from "../provider/CswapDiscovery.ts";
 import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 import * as EventSink from "./EventSink.ts";
 import * as ProjectionStore from "./ProjectionStore.ts";
@@ -131,16 +133,64 @@ export function planClaudeAccountFallback(input: {
   };
 }
 
+/**
+ * The usage-limit error a failed run ended with, on its current attempt.
+ * The run can fail after its error item was recorded, so a run failure is
+ * checked against the items it already has.
+ */
+export function usageLimitItemForFailedRun(
+  run: OrchestrationV2Run,
+  turnItems: ReadonlyArray<OrchestrationV2TurnItem>,
+): OrchestrationV2TurnItem | null {
+  if (run.status !== "failed" || run.rootNodeId === null) return null;
+  return (
+    turnItems.findLast(
+      (item) =>
+        item.runId === run.id &&
+        item.nodeId === run.rootNodeId &&
+        claudeUsageLimitTrigger(item) === "failed",
+    ) ?? null
+  );
+}
+
+/**
+ * Accounts a thread recently left. An account enters only after the move
+ * away from it was dispatched, so a failed dispatch never keeps it out.
+ */
+export class LeftAccounts {
+  private readonly leftAt = new Map<number, number>();
+
+  excluded(nowMs: number): ReadonlySet<number> {
+    for (const [account, at] of this.leftAt) {
+      if (nowMs - at > LEFT_ACCOUNT_COOLDOWN_MS) this.leftAt.delete(account);
+    }
+    return new Set(this.leftAt.keys());
+  }
+
+  /** Dispatch the move, then remember the account it left. */
+  dispatch<E, R>(
+    plan: ClaudeAccountFallbackPlan,
+    nowMs: number,
+    dispatch: (command: OrchestrationV2Command) => Effect.Effect<unknown, E, R>,
+  ): Effect.Effect<void, E, R> {
+    return dispatch(plan.command).pipe(
+      Effect.tap(() => Effect.sync(() => this.leftAt.set(plan.fromAccount.number, nowMs))),
+      Effect.asVoid,
+    );
+  }
+}
+
 const make = Effect.gen(function* () {
   const eventSink = yield* EventSink.EventSinkV2;
   const projections = yield* ProjectionStore.ProjectionStoreV2;
   const threads = yield* ThreadManagement.ThreadManagementService;
   const registry = yield* ProviderInstanceRegistry.ProviderInstanceRegistry;
-  const leftAccounts = new Map<number, number>();
+  const discovery = yield* CswapDiscovery.CswapDiscovery;
+  const leftAccounts = new LeftAccounts();
 
   const handle = Effect.fn("ClaudeAccountFallbackWorker.handle")(function* (
     threadId: OrchestrationV2AppThread["id"],
-    item: OrchestrationV2TurnItem,
+    trigger: { readonly item: OrchestrationV2TurnItem } | { readonly runId: RunId },
   ) {
     const instances = yield* registry.listInstances;
     const cswapInstances = instances.filter(
@@ -148,11 +198,20 @@ const make = Effect.gen(function* () {
     );
     if (cswapInstances.length === 0) return;
     const projection = yield* projections.getThreadProjection(threadId);
+    const item =
+      "item" in trigger
+        ? trigger.item
+        : (() => {
+            const run = projection.runs.find((candidate) => candidate.id === trigger.runId);
+            return run === undefined ? null : usageLimitItemForFailedRun(run, projection.turnItems);
+          })();
+    if (item === null) return;
     const current = instances.find(
       (instance) => instance.instanceId === projection.thread.providerInstanceId,
     );
     if (current === undefined) return;
-    const accounts = yield* listCswapAccounts();
+    // The list cswap discovery keeps current, with usage readings at most a minute old.
+    const accounts = yield* discovery.accounts;
     // Any other instance sharing cswap's transcripts runs on Claude's default
     // login, which is cswap's active account.
     const sharesCswapHistory = cswapInstances.some(
@@ -166,9 +225,6 @@ const make = Effect.gen(function* () {
         ? (accounts.find((account) => account.active)?.number ?? null)
         : null);
     const nowMs = DateTime.toEpochMillis(yield* DateTime.now);
-    for (const [account, leftAt] of leftAccounts) {
-      if (nowMs - leftAt > LEFT_ACCOUNT_COOLDOWN_MS) leftAccounts.delete(account);
-    }
     const plan = planClaudeAccountFallback({
       item,
       thread: projection.thread,
@@ -180,33 +236,42 @@ const make = Effect.gen(function* () {
           .filter((instance) => instance.enabled)
           .map((instance) => instance.instanceId),
       ),
-      excludedAccountNumbers: new Set(leftAccounts.keys()),
+      excludedAccountNumbers: leftAccounts.excluded(nowMs),
     });
     if (plan === null) return;
-    leftAccounts.set(plan.fromAccount.number, nowMs);
     yield* Effect.logInfo("orchestration-v2.claude-account-fallback", {
       threadId,
       fromAccount: plan.fromAccount.number,
       toAccount: plan.toAccount.number,
     });
-    yield* threads.dispatch(plan.command);
+    yield* leftAccounts.dispatch(plan, nowMs, threads.dispatch);
   });
 
+  const handleSafely = (
+    threadId: OrchestrationV2AppThread["id"],
+    trigger: Parameters<typeof handle>[1],
+  ) =>
+    handle(threadId, trigger).pipe(
+      Effect.catchCause((cause) =>
+        Effect.logWarning("orchestration-v2.claude-account-fallback.failed", { threadId, cause }),
+      ),
+    );
+
   const afterSequence = yield* eventSink.latestSequence();
-  yield* eventSink.stream({ afterSequence, eventType: "turn-item.updated" }).pipe(
-    Stream.runForEach((stored) =>
-      stored.event.type === "turn-item.updated" &&
-      claudeUsageLimitTrigger(stored.event.payload) !== null
-        ? handle(stored.event.threadId, stored.event.payload).pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("orchestration-v2.claude-account-fallback.failed", {
-                threadId: stored.event.threadId,
-                cause,
-              }),
-            ),
-          )
-        : Effect.void,
-    ),
+  // A failed run is checked as well as its error item, since either can commit first.
+  yield* Stream.merge(
+    eventSink.stream({ afterSequence, eventType: "turn-item.updated" }),
+    eventSink.stream({ afterSequence, eventType: "run.updated" }),
+  ).pipe(
+    Stream.runForEach(({ event }) => {
+      if (event.type === "turn-item.updated" && claudeUsageLimitTrigger(event.payload) !== null) {
+        return handleSafely(event.threadId, { item: event.payload });
+      }
+      if (event.type === "run.updated" && event.payload.status === "failed") {
+        return handleSafely(event.threadId, { runId: event.payload.id });
+      }
+      return Effect.void;
+    }),
     Effect.catchCause((cause) =>
       Effect.logWarning("orchestration-v2.claude-account-fallback.stopped", { cause }),
     ),

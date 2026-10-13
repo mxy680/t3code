@@ -6,6 +6,7 @@ import {
   cswapInstanceId,
   cswapProviderInstances,
   parseCswapAccountList,
+  routeUndiscoveredCswapInstance,
   parseCswapConfigDirOutput,
   type CswapAccount,
 } from "./cswapAccounts.ts";
@@ -80,10 +81,11 @@ describe("parseCswapAccountList", () => {
     ]);
   });
 
-  it("treats unreadable output as no accounts", () => {
-    expect(parseCswapAccountList("")).toEqual([]);
-    expect(parseCswapAccountList("not json")).toEqual([]);
-    expect(parseCswapAccountList(JSON.stringify({ error: { message: "boom" } }))).toEqual([]);
+  it("reports unreadable output instead of an empty account list", () => {
+    expect(parseCswapAccountList("")).toBeNull();
+    expect(parseCswapAccountList("not json")).toBeNull();
+    expect(parseCswapAccountList(JSON.stringify({ error: { message: "boom" } }))).toBeNull();
+    expect(parseCswapAccountList(JSON.stringify({ accounts: [] }))).toEqual([]);
   });
 });
 
@@ -110,7 +112,7 @@ describe("cswap instances", () => {
   });
 
   it("builds one Claude instance per prepared account", () => {
-    const accounts = parseCswapAccountList(LIST_JSON);
+    const accounts = parseCswapAccountList(LIST_JSON) ?? [];
     const instances = cswapProviderInstances(
       accounts,
       new Map([
@@ -133,6 +135,41 @@ describe("cswap instances", () => {
     expect(cswapProviderInstances(accounts, new Map([[1, null]]))).not.toHaveProperty(
       "claude_cswap_3",
     );
+  });
+
+  it("leaves out the default login when the server inherited another CLAUDE_CONFIG_DIR", () => {
+    const accounts = parseCswapAccountList(LIST_JSON) ?? [];
+    const instances = cswapProviderInstances(
+      accounts,
+      new Map([
+        [1, null],
+        [3, "/profiles/3"],
+      ]),
+      "/somewhere/else",
+    );
+    expect(Object.keys(instances)).toEqual(["claude_cswap_3"]);
+  });
+});
+
+describe("routeUndiscoveredCswapInstance", () => {
+  const command = {
+    type: "message.dispatch",
+    modelSelection: { instanceId: cswapInstanceId(5), model: "claude-sonnet-4-5" },
+  };
+
+  it("sends work for an account the server does not run to the default Claude instance", () => {
+    expect(routeUndiscoveredCswapInstance(command, () => false).modelSelection).toEqual({
+      instanceId: "claudeAgent",
+      model: "claude-sonnet-4-5",
+    });
+  });
+
+  it("leaves running accounts, other providers, and commands without a selection alone", () => {
+    expect(routeUndiscoveredCswapInstance(command, () => true)).toBe(command);
+    const codex = { modelSelection: { instanceId: "codex", model: "gpt-5" } };
+    expect(routeUndiscoveredCswapInstance(codex, () => false)).toBe(codex);
+    const plain = { type: "run.interrupt" };
+    expect(routeUndiscoveredCswapInstance(plain, () => false)).toBe(plain);
   });
 });
 

@@ -10,10 +10,16 @@ import {
   type OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import { it as effectIt } from "@effect/vitest";
 import { describe, expect, it } from "vite-plus/test";
 
 import { cswapInstanceId, type CswapAccount } from "../provider/cswapAccounts.ts";
-import { planClaudeAccountFallback } from "./ClaudeAccountFallbackWorker.ts";
+import {
+  LeftAccounts,
+  planClaudeAccountFallback,
+  usageLimitItemForFailedRun,
+} from "./ClaudeAccountFallbackWorker.ts";
 
 const now = DateTime.makeUnsafe("2026-10-13T12:00:00.000Z");
 const threadId = ThreadId.make("thread-1");
@@ -186,4 +192,57 @@ describe("planClaudeAccountFallback", () => {
     });
     expect(result?.toAccount.number).toBe(3);
   });
+});
+
+describe("usageLimitItemForFailedRun", () => {
+  it("finds the limit error once the run fails after its error item was recorded", () => {
+    // The error item arrives while the run is still running: no move yet.
+    expect(plan({ item: failedItem, runs: [run({ status: "running" })] })).toBeNull();
+    // The run then fails; its stored error item now plans the move.
+    const failedRun = run({ status: "failed", completedAt: now });
+    const item = usageLimitItemForFailedRun(failedRun, [pausedNotice, failedItem]);
+    expect(item).toBe(failedItem);
+    expect(plan({ item: item!, runs: [failedRun] })?.command).toMatchObject({
+      dispatchMode: { type: "start_immediately" },
+    });
+  });
+
+  it("ignores runs that did not fail on a limit or errors from an earlier attempt", () => {
+    expect(usageLimitItemForFailedRun(run({ status: "running" }), [failedItem])).toBeNull();
+    expect(
+      usageLimitItemForFailedRun(run({ status: "failed" }), [
+        { ...failedItem, nodeId: NodeId.make("node-root-1") },
+      ]),
+    ).toBeNull();
+    expect(
+      usageLimitItemForFailedRun(run({ status: "failed" }), [
+        { ...failedItem, failure: { ...failedItem.failure, class: "provider_error" } },
+      ]),
+    ).toBeNull();
+  });
+});
+
+describe("LeftAccounts", () => {
+  const nowMs = Date.parse("2026-10-13T12:00:00.000Z");
+
+  effectIt.effect("keeps an account available when the move away from it fails", () =>
+    Effect.gen(function* () {
+      const left = new LeftAccounts();
+      const move = plan()!;
+      yield* left.dispatch(move, nowMs, () => Effect.fail("rejected")).pipe(Effect.ignore);
+      expect(left.excluded(nowMs).size).toBe(0);
+    }),
+  );
+
+  effectIt.effect("holds the left account out for the cooldown after a successful move", () =>
+    Effect.gen(function* () {
+      const left = new LeftAccounts();
+      const move = plan()!;
+      const dispatched: Array<unknown> = [];
+      yield* left.dispatch(move, nowMs, (command) => Effect.sync(() => dispatched.push(command)));
+      expect(dispatched).toEqual([move.command]);
+      expect([...left.excluded(nowMs + 60_000)]).toEqual([1]);
+      expect(left.excluded(nowMs + 31 * 60_000).size).toBe(0);
+    }),
+  );
 });

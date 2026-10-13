@@ -89,9 +89,17 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
         yield* fileSystem.makeDirectory(linked, { recursive: true });
         yield* fileSystem.symlink(path.join(shared, "projects"), path.join(linked, "projects"));
         yield* fileSystem.makeDirectory(path.join(separate, "projects"), { recursive: true });
+        // A second hop still lands on the folder that holds the transcripts.
+        const twice = path.join(root, "twice");
+        yield* fileSystem.makeDirectory(twice, { recursive: true });
+        yield* fileSystem.symlink(path.join(linked, "projects"), path.join(twice, "projects"));
+        const realShared = yield* fileSystem.realPath(shared);
 
         expect(yield* makeClaudeContinuationGroupKey({ homePath: linked })).toBe(
-          `claude:home:${shared}`,
+          `claude:home:${realShared}`,
+        );
+        expect(yield* makeClaudeContinuationGroupKey({ homePath: twice })).toBe(
+          `claude:home:${realShared}`,
         );
         expect(yield* makeClaudeContinuationGroupKey({ homePath: separate })).toBe(
           `claude:home:${separate}`,

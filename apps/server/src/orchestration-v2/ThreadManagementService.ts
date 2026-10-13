@@ -51,6 +51,8 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import { routeUndiscoveredCswapInstance } from "../provider/cswapAccounts.ts";
+import * as ProviderInstanceRegistry from "../provider/ProviderInstanceRegistry.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -651,10 +653,27 @@ const make = Effect.gen(function* () {
     }
   };
 
-  const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
-    ensureCommandTranscripts(command).pipe(
-      Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
+  const providerInstances = yield* Effect.serviceOption(
+    ProviderInstanceRegistry.ProviderInstanceRegistry,
+  );
+  const routeCswapCommand = (command: OrchestrationV2ServerCommand) =>
+    Option.isNone(providerInstances)
+      ? Effect.succeed(command)
+      : providerInstances.value.listInstances.pipe(
+          Effect.map((instances) => {
+            const running = new Set<string>(instances.map((instance) => instance.instanceId));
+            return routeUndiscoveredCswapInstance(command, (instanceId) => running.has(instanceId));
+          }),
+        );
+
+  const dispatch: ThreadManagementServiceShape["dispatch"] = (requested) =>
+    routeCswapCommand(requested).pipe(
+      Effect.flatMap((command) =>
+        ensureCommandTranscripts(command).pipe(
+          Effect.andThen(assertDispatchTargetEnabled(command)),
+          Effect.andThen(orchestrator.dispatch(command)),
+        ),
+      ),
     );
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>

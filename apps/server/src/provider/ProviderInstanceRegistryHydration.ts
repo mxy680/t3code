@@ -17,10 +17,10 @@
  *      `ProviderInstanceRegistryMutator.reconcile` on every emission.
  *
  * When the `cswap` CLI manages several Claude logins, each of its accounts
- * also runs as a Claude instance (`claude_cswap_<n>`). They are discovered in
- * the background, so startup never waits on cswap, and re-read when cswap's
- * account list or default login changes. An explicit settings entry with the
- * same id replaces the discovered one.
+ * also runs as a Claude instance (`claude_cswap_<n>`). `CswapDiscovery`
+ * finds them in the background, so startup never waits on cswap, and this
+ * layer exposes it for other readers of the instance map. An explicit
+ * settings entry with the same id replaces the discovered one.
  *
  * Failures inside the watcher are logged and swallowed so a single bad
  * settings emission cannot kill the registry. Unknown drivers and invalid
@@ -38,21 +38,13 @@ import {
   type ProviderInstanceId,
   ServerSettings,
 } from "@t3tools/contracts";
-import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
-import * as Ref from "effect/Ref";
-import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 
 import * as Settings from "../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "./builtInDrivers.ts";
-import {
-  cswapProviderInstances,
-  listCswapAccounts,
-  resolveCswapConfigDir,
-  type CswapAccount,
-} from "./cswapAccounts.ts";
+import * as CswapDiscovery from "./CswapDiscovery.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderOrchestrationAdapterInfrastructure from "./ProviderOrchestrationAdapterInfrastructure.ts";
@@ -136,50 +128,38 @@ const layerSettingsWatcher = Layer.effectDiscard(
   Effect.gen(function* () {
     const mutator = yield* ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator;
     const serverSettings = yield* Settings.ServerSettingsService;
-    const discovered = yield* Ref.make<Record<string, ProviderInstanceConfig>>({});
-    const reconcile = (settings: ServerSettings) =>
-      Ref.get(discovered).pipe(
-        Effect.flatMap((instances) =>
-          mutator.reconcile(deriveProviderInstanceConfigMap(settings, instances)),
-        ),
-        Effect.catchCause((cause) =>
-          Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
-        ),
-      );
+    const discovery = yield* CswapDiscovery.CswapDiscovery;
+    const reconcile = (
+      settings: ServerSettings,
+      discovered: Readonly<Record<string, ProviderInstanceConfig>>,
+    ) =>
+      mutator
+        .reconcile(deriveProviderInstanceConfigMap(settings, discovered))
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
+          ),
+        );
     const settingsChanges = yield* serverSettings.subscribeChanges;
-    yield* settingsChanges.pipe(Stream.runForEach(reconcile), Effect.forkScoped);
-
-    // Preparing a profile runs Claude's login check, so profiles are prepared
-    // again only when cswap's accounts or its default login change.
-    const lastAccountsKey = yield* Ref.make("");
-    const refreshCswapInstances = Effect.gen(function* () {
-      const accounts = yield* listCswapAccounts();
-      const accountsKey = cswapAccountsKey(accounts);
-      if (accountsKey === (yield* Ref.get(lastAccountsKey))) return;
-      const configDirs = new Map<number, string | null>();
-      for (const account of accounts) {
-        const configDir = yield* resolveCswapConfigDir(account.number);
-        if (configDir !== undefined) configDirs.set(account.number, configDir);
-      }
-      yield* Ref.set(lastAccountsKey, accountsKey);
-      yield* Ref.set(discovered, cswapProviderInstances(accounts, configDirs));
-      yield* reconcile(yield* serverSettings.getSettings);
-    }).pipe(
-      Effect.catchCause((cause) => Effect.logWarning("cswap account discovery failed", cause)),
+    yield* settingsChanges.pipe(
+      Stream.runForEach((settings) =>
+        discovery.instances.pipe(Effect.flatMap((discovered) => reconcile(settings, discovered))),
+      ),
+      Effect.forkScoped,
     );
-    yield* refreshCswapInstances.pipe(
-      Effect.repeat(Schedule.spaced(CSWAP_REFRESH_INTERVAL)),
+    yield* discovery.instanceChanges.pipe(
+      Stream.runForEach((discovered) =>
+        serverSettings.getSettings.pipe(
+          Effect.flatMap((settings) => reconcile(settings, discovered)),
+          Effect.catchCause((cause) =>
+            Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
+          ),
+        ),
+      ),
       Effect.forkScoped,
     );
   }),
 );
-
-const CSWAP_REFRESH_INTERVAL = Duration.minutes(1);
-
-const cswapAccountsKey = (accounts: ReadonlyArray<CswapAccount>) =>
-  JSON.stringify(
-    accounts.map(({ number, email, label, active }) => [number, email, label, active]),
-  );
 
 /**
  * Hydrate `ProviderInstanceRegistry` from `ServerSettings` and keep it in
@@ -198,19 +178,21 @@ const cswapAccountsKey = (accounts: ReadonlyArray<CswapAccount>) =>
  * it, so the visibility leak is harmless in practice.
  */
 export const layer: Layer.Layer<
-  ProviderInstanceRegistry.ProviderInstanceRegistry,
+  ProviderInstanceRegistry.ProviderInstanceRegistry | CswapDiscovery.CswapDiscovery,
   never,
   ProviderInstanceRegistryHydrationEnv
 > = Layer.unwrap(
   Effect.gen(function* () {
     const serverSettings = yield* Settings.ServerSettingsService;
+    const discovery = yield* CswapDiscovery.CswapDiscovery;
     const initialSettings: ServerSettings | undefined = yield* serverSettings.getSettings.pipe(
       Effect.orElseSucceed(() => undefined),
     );
+    // Cached cswap accounts route their threads before the first refresh finishes.
     const initialConfigMap =
       initialSettings === undefined
         ? ({} as ProviderInstanceConfigMap)
-        : deriveProviderInstanceConfigMap(initialSettings);
+        : deriveProviderInstanceConfigMap(initialSettings, yield* discovery.instances);
 
     const layerMutable = ProviderInstanceRegistry.layer({
       drivers: BUILT_IN_DRIVERS,
@@ -223,8 +205,8 @@ export const layer: Layer.Layer<
 
     return layerSettingsWatcher.pipe(Layer.provideMerge(layerMutable));
   }),
-) as Layer.Layer<
-  ProviderInstanceRegistry.ProviderInstanceRegistry,
+).pipe(Layer.provideMerge(CswapDiscovery.layer)) as Layer.Layer<
+  ProviderInstanceRegistry.ProviderInstanceRegistry | CswapDiscovery.CswapDiscovery,
   never,
   ProviderInstanceRegistryHydrationEnv
 >;
