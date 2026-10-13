@@ -1,5 +1,6 @@
 import type { ClaudeSettings } from "@t3tools/contracts";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
@@ -53,13 +54,30 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
   };
 });
 
+/**
+ * Instances can resume each other's sessions when Claude keeps their
+ * transcripts in the same place. A config directory whose `projects` folder
+ * links into another one (as `cswap run --share-history` profiles link into
+ * `~/.claude`) therefore joins that directory's group.
+ */
 export const makeClaudeContinuationGroupKey = Effect.fn("makeClaudeContinuationGroupKey")(
   function* (
     config: Pick<ClaudeSettings, "homePath">,
     environment?: NodeJS.ProcessEnv,
-  ): Effect.fn.Return<string, never, Path.Path> {
+  ): Effect.fn.Return<string, never, Path.Path | FileSystem.FileSystem> {
+    const path = yield* Path.Path;
+    const fileSystem = yield* FileSystem.FileSystem;
     const resolvedHomePath = yield* resolveClaudeHomePath(config, environment);
-    return `claude:home:${resolvedHomePath}`;
+    const projectsPath = path.join(resolvedHomePath, "projects");
+    const linkedProjects = yield* fileSystem.readLink(projectsPath).pipe(
+      Effect.map((target) => path.resolve(resolvedHomePath, target)),
+      Effect.orElseSucceed(() => undefined),
+    );
+    const transcriptHome =
+      linkedProjects !== undefined && path.basename(linkedProjects) === "projects"
+        ? path.dirname(linkedProjects)
+        : resolvedHomePath;
+    return `claude:home:${transcriptHome}`;
   },
 );
 

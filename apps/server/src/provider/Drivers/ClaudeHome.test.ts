@@ -3,6 +3,7 @@ import * as NodeOS from "node:os";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
+import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 
 import {
@@ -75,6 +76,28 @@ it.layer(NodeServices.layer)("ClaudeHome", (it) => {
       expect(message).not.toContain("CLAUDE_CONFIG_DIR=");
       expect(message).toContain("then start a new thread");
     });
+
+    it.effect("groups a config directory with the one its transcripts link into", () =>
+      Effect.gen(function* () {
+        const fileSystem = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "claude-home-" });
+        const shared = path.join(root, "shared");
+        const linked = path.join(root, "linked");
+        const separate = path.join(root, "separate");
+        yield* fileSystem.makeDirectory(path.join(shared, "projects"), { recursive: true });
+        yield* fileSystem.makeDirectory(linked, { recursive: true });
+        yield* fileSystem.symlink(path.join(shared, "projects"), path.join(linked, "projects"));
+        yield* fileSystem.makeDirectory(path.join(separate, "projects"), { recursive: true });
+
+        expect(yield* makeClaudeContinuationGroupKey({ homePath: linked })).toBe(
+          `claude:home:${shared}`,
+        );
+        expect(yield* makeClaudeContinuationGroupKey({ homePath: separate })).toBe(
+          `claude:home:${separate}`,
+        );
+      }).pipe(Effect.scoped),
+    );
 
     it.effect("separates capability probes by cwd", () =>
       Effect.gen(function* () {

@@ -16,6 +16,12 @@
  *      acquires `ServerSettingsService.subscribeChanges` and calls
  *      `ProviderInstanceRegistryMutator.reconcile` on every emission.
  *
+ * When the `cswap` CLI manages several Claude logins, each of its accounts
+ * also runs as a Claude instance (`claude_cswap_<n>`). They are discovered in
+ * the background, so startup never waits on cswap, and re-read when cswap's
+ * account list or default login changes. An explicit settings entry with the
+ * same id replaces the discovered one.
+ *
  * Failures inside the watcher are logged and swallowed so a single bad
  * settings emission cannot kill the registry. Unknown drivers and invalid
  * configs already round-trip through the registry's own "unavailable"
@@ -32,12 +38,21 @@ import {
   type ProviderInstanceId,
   ServerSettings,
 } from "@t3tools/contracts";
+import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
+import * as Ref from "effect/Ref";
+import * as Schedule from "effect/Schedule";
 import * as Stream from "effect/Stream";
 
 import * as Settings from "../serverSettings.ts";
 import { BUILT_IN_DRIVERS, type BuiltInDriversEnv } from "./builtInDrivers.ts";
+import {
+  cswapProviderInstances,
+  listCswapAccounts,
+  resolveCswapConfigDir,
+  type CswapAccount,
+} from "./cswapAccounts.ts";
 import * as ProviderInstanceRegistry from "./ProviderInstanceRegistry.ts";
 import * as ProviderInstanceRegistryMutator from "./ProviderInstanceRegistryMutator.ts";
 import * as ProviderOrchestrationAdapterInfrastructure from "./ProviderOrchestrationAdapterInfrastructure.ts";
@@ -61,13 +76,17 @@ type ProviderInstanceRegistryHydrationEnv =
 
 /**
  * Explicit `providerInstances` entries plus an implicit default instance for
- * each built-in driver whose default slot is empty. Pure so the hydration
- * rule can be tested without layers.
+ * each built-in driver whose default slot is empty, plus discovered cswap
+ * account instances. Pure so the hydration rule can be tested without layers.
  */
 export const deriveProviderInstanceConfigMap = (
   settings: ServerSettings,
+  discoveredInstances: Readonly<Record<string, ProviderInstanceConfig>> = {},
 ): ProviderInstanceConfigMap => {
-  const merged: Record<string, ProviderInstanceConfig> = { ...settings.providerInstances };
+  const merged: Record<string, ProviderInstanceConfig> = {
+    ...discoveredInstances,
+    ...settings.providerInstances,
+  };
 
   for (const driver of BUILT_IN_DRIVERS) {
     if (driver.metadata.hasDefaultInstance === false) continue;
@@ -117,21 +136,50 @@ const layerSettingsWatcher = Layer.effectDiscard(
   Effect.gen(function* () {
     const mutator = yield* ProviderInstanceRegistryMutator.ProviderInstanceRegistryMutator;
     const serverSettings = yield* Settings.ServerSettingsService;
+    const discovered = yield* Ref.make<Record<string, ProviderInstanceConfig>>({});
+    const reconcile = (settings: ServerSettings) =>
+      Ref.get(discovered).pipe(
+        Effect.flatMap((instances) =>
+          mutator.reconcile(deriveProviderInstanceConfigMap(settings, instances)),
+        ),
+        Effect.catchCause((cause) =>
+          Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
+        ),
+      );
     const settingsChanges = yield* serverSettings.subscribeChanges;
-    yield* settingsChanges.pipe(
-      Stream.runForEach((next) =>
-        mutator
-          .reconcile(deriveProviderInstanceConfigMap(next))
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logError("ProviderInstanceRegistry reconcile failed", cause),
-            ),
-          ),
-      ),
+    yield* settingsChanges.pipe(Stream.runForEach(reconcile), Effect.forkScoped);
+
+    // Preparing a profile runs Claude's login check, so profiles are prepared
+    // again only when cswap's accounts or its default login change.
+    const lastAccountsKey = yield* Ref.make("");
+    const refreshCswapInstances = Effect.gen(function* () {
+      const accounts = yield* listCswapAccounts();
+      const accountsKey = cswapAccountsKey(accounts);
+      if (accountsKey === (yield* Ref.get(lastAccountsKey))) return;
+      const configDirs = new Map<number, string | null>();
+      for (const account of accounts) {
+        const configDir = yield* resolveCswapConfigDir(account.number);
+        if (configDir !== undefined) configDirs.set(account.number, configDir);
+      }
+      yield* Ref.set(lastAccountsKey, accountsKey);
+      yield* Ref.set(discovered, cswapProviderInstances(accounts, configDirs));
+      yield* reconcile(yield* serverSettings.getSettings);
+    }).pipe(
+      Effect.catchCause((cause) => Effect.logWarning("cswap account discovery failed", cause)),
+    );
+    yield* refreshCswapInstances.pipe(
+      Effect.repeat(Schedule.spaced(CSWAP_REFRESH_INTERVAL)),
       Effect.forkScoped,
     );
   }),
 );
+
+const CSWAP_REFRESH_INTERVAL = Duration.minutes(1);
+
+const cswapAccountsKey = (accounts: ReadonlyArray<CswapAccount>) =>
+  JSON.stringify(
+    accounts.map(({ number, email, label, active }) => [number, email, label, active]),
+  );
 
 /**
  * Hydrate `ProviderInstanceRegistry` from `ServerSettings` and keep it in

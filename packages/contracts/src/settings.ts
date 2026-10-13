@@ -1377,12 +1377,20 @@ const DEFAULT_ENABLED_DEFAULT_INSTANCES: ReadonlySet<ProviderInstanceId> = new S
 );
 
 /**
- * Whether the built-in default instance at `instanceId` is enabled while
- * settings have no `providerInstances` entry for it. Only Codex and Claude
- * start on; any other id without an entry has no running instance.
+ * Claude instances the server derives from the `cswap` account switcher, one
+ * per account (`claude_cswap_<n>`). They run without a settings entry.
+ */
+export const CSWAP_PROVIDER_INSTANCE_PREFIX = "claude_cswap_";
+
+/**
+ * Whether the instance at `instanceId` is enabled while settings have no
+ * `providerInstances` entry for it. The Codex and Claude defaults and
+ * discovered cswap accounts start on; any other id without an entry has no
+ * running instance.
  */
 export const isUnconfiguredDefaultInstanceEnabled = (instanceId: ProviderInstanceId): boolean =>
-  DEFAULT_ENABLED_DEFAULT_INSTANCES.has(instanceId);
+  DEFAULT_ENABLED_DEFAULT_INSTANCES.has(instanceId) ||
+  instanceId.startsWith(CSWAP_PROVIDER_INSTANCE_PREFIX);
 
 /**
  * Default enabled state for a driver when neither the envelope nor the config

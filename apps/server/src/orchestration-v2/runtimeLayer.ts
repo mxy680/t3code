@@ -1,4 +1,5 @@
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
+import * as ClaudeAccountFallbackWorker from "./ClaudeAccountFallbackWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
 import * as OrchestrationCommandReceipts from "../persistence/OrchestrationCommandReceipts.ts";
@@ -358,6 +359,11 @@ export const layerProduction = Layer.mergeAll(
   layerSecretRequestsProvided,
   UsageLimitRecoveryWorker.layer.pipe(
     Layer.provide(Layer.mergeAll(ProjectionStore.layer, layerThreadManagementProvided)),
+  ),
+  ClaudeAccountFallbackWorker.layer.pipe(
+    Layer.provide(
+      Layer.mergeAll(ProjectionStore.layer, layerThreadManagementProvided, layerEventSinkProvided),
+    ),
   ),
   layerProviderContinuationWorkerProvided,
   layerAgentSessionImporterProvided,

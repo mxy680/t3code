@@ -119,4 +119,32 @@ describe("deriveProviderInstanceConfigMap", () => {
       enabled: true,
     });
   });
+
+  it("adds discovered cswap accounts unless settings configure the same instance", () => {
+    const discoveredId = ProviderInstanceId.make("claude_cswap_3");
+    const configuredId = ProviderInstanceId.make("claude_cswap_1");
+    const discovered = {
+      [discoveredId]: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        displayName: "personal",
+        config: { homePath: "/profiles/3" },
+      },
+      [configuredId]: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        displayName: "work",
+        config: { homePath: "" },
+      },
+    };
+    const settings = settingsWith({
+      providerInstances: {
+        [configuredId]: { driver: ProviderDriverKind.make("claudeAgent"), enabled: false },
+      },
+    });
+
+    const merged = deriveProviderInstanceConfigMap(settings, discovered);
+
+    expect(merged[discoveredId]).toBe(discovered[discoveredId]);
+    expect(merged[configuredId]).toBe(settings.providerInstances[configuredId]);
+    expect(deriveProviderInstanceConfigMap(settings)[discoveredId]).toBeUndefined();
+  });
 });

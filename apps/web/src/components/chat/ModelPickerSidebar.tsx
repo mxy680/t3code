@@ -5,6 +5,7 @@ import { SparklesIcon, StarIcon } from "lucide-react";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { cn } from "~/lib/utils";
+import { remainingPercent } from "@t3tools/shared/usageLimits";
 import {
   isProviderInstancePickerReady,
   shouldShowInstanceBadge,
@@ -28,6 +29,19 @@ function describeUnavailableInstance(entry: ProviderInstanceEntry): string {
     entry.status === "error" ? "Unavailable" : entry.status === "warning" ? "Limited" : "Not ready";
   const msg = entry.snapshot.message?.trim();
   return msg ? `${label} — ${kind}. ${msg}` : `${label} — ${kind}.`;
+}
+
+/**
+ * Name plus the quota left on the account's session and weekly windows, so
+ * choosing between accounts of one provider shows which has room.
+ */
+function describeReadyInstance(entry: ProviderInstanceEntry): string {
+  const windows = entry.snapshot.usageLimits?.windows ?? [];
+  const shown = (["session", "weekly"] as const).flatMap((kind) => {
+    const window = windows.find((candidate) => candidate.kind === kind);
+    return window ? [`${window.label} ${remainingPercent(window)}% left`] : [];
+  });
+  return shown.length === 0 ? entry.displayName : `${entry.displayName} — ${shown.join(", ")}`;
 }
 
 const SELECTED_INDICATOR_CLASS =
@@ -166,7 +180,7 @@ export const ModelPickerSidebar = memo(function ModelPickerSidebar(props: {
                 ? (props.getDisabledInstanceTooltip?.(entry) ?? entry.displayName)
                 : showNewBadge
                   ? `${entry.displayName} — New`
-                  : entry.displayName;
+                  : describeReadyInstance(entry);
 
             const button = (
               <Toolbar.Button
