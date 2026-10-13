@@ -386,9 +386,11 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   const commandPaths = [context.resolvedCommandPath, context.realCommandPath];
   const packageName = definition.npmPackageName;
 
-  const app = yield* appBundleManagingExecutable(context);
+  const launcherScript = yield* readLauncherScript(context);
+  const app = appBundleManagingExecutable(context, launcherScript);
   if (app) {
-    return { ...manual, managedBy: app };
+    // The app ships its own updates, so there is no registry version to compare.
+    return { ...manual, managedBy: app, latestVersion: null };
   }
 
   const nativeUpdate = definition.nativeUpdate;
@@ -486,7 +488,7 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
     });
   }
 
-  if (commandPaths.some(isMiseCommandPath) || (yield* isMiseWrapperScript(context))) {
+  if (commandPaths.some(isMiseCommandPath) || isMiseWrapperScript(launcherScript)) {
     return manual;
   }
 
@@ -538,54 +540,58 @@ export const resolvePackageManagedProviderMaintenance = Effect.fn(
   return fallback;
 });
 
-const APP_BUNDLE_PATTERN = /\/([^/]+)\.app\//i;
-const APP_WRAPPER_EXEC_PATTERN = /^\s*exec\s+(?:-a\s+\S+\s+)?["']?([^"'\s]+\.app\/[^"'\s]*)/im;
+const APP_BUNDLE_PATTERN = /\/([^/]+)\.app\/Contents\//i;
+const WRAPPER_EXEC_LINE_PATTERN = /\bexec\s/g;
+const WRAPPER_EXEC_TARGET_PATTERN = /\bexec\s+(?:"([^"]+)"|'([^']+)'|(\S+))/;
 
-/**
- * The app (`ChatGPT`) whose bundle holds the executable, found through the
- * real path (symlinks) or a small launcher script that `exec`s into the
- * bundle. The app updates it, so a package manager or `<cmd> update` cannot.
- */
-const appBundleManagingExecutable = Effect.fn("appBundleManagingExecutable")(function* (
+/** The text of a small `#!` launcher script, or "" for a binary, a big file, or an unreadable one. */
+const readLauncherScript = Effect.fn("readLauncherScript")(function* (
   context: ProviderMaintenanceResolutionContext,
 ) {
-  const fromPath = (value: string) => APP_BUNDLE_PATTERN.exec(value.replaceAll("\\", "/"))?.[1];
-  const direct = fromPath(context.realCommandPath) ?? fromPath(context.resolvedCommandPath);
+  const fileSystem = yield* FileSystem.FileSystem;
+  const size = yield* fileSystem.stat(context.realCommandPath).pipe(
+    Effect.map((info) => Number(info.size)),
+    Effect.orElseSucceed(() => Infinity),
+  );
+  if (size > MISE_WRAPPER_MAX_BYTES) {
+    return "";
+  }
+  const script = yield* fileSystem
+    .readFileString(context.realCommandPath)
+    .pipe(Effect.orElseSucceed(() => ""));
+  return script.startsWith("#!") ? script : "";
+});
+
+/**
+ * The macOS app (`ChatGPT`) whose bundle holds the executable, found through
+ * the real path (symlinks) or a launcher script whose only `exec` goes into
+ * the bundle. The app updates it, so a package manager or `<cmd> update`
+ * cannot.
+ */
+function appBundleManagingExecutable(
+  context: ProviderMaintenanceResolutionContext,
+  launcherScript: string,
+): string | null {
+  if (context.platform !== "darwin") {
+    return null;
+  }
+  const fromPath = (value: string) => APP_BUNDLE_PATTERN.exec(value)?.[1];
+  const direct = fromPath(context.realCommandPath);
   if (direct) {
     return direct;
   }
-  const fileSystem = yield* FileSystem.FileSystem;
-  const size = yield* fileSystem.stat(context.realCommandPath).pipe(
-    Effect.map((info) => Number(info.size)),
-    Effect.orElseSucceed(() => Infinity),
-  );
-  if (size > MISE_WRAPPER_MAX_BYTES) {
+  if ((launcherScript.match(WRAPPER_EXEC_LINE_PATTERN)?.length ?? 0) !== 1) {
     return null;
   }
-  const script = yield* fileSystem
-    .readFileString(context.realCommandPath)
-    .pipe(Effect.orElseSucceed(() => ""));
-  const target = script.startsWith("#!") ? APP_WRAPPER_EXEC_PATTERN.exec(script)?.[1] : undefined;
+  const match = WRAPPER_EXEC_TARGET_PATTERN.exec(launcherScript);
+  const target = match?.[1] ?? match?.[2] ?? match?.[3];
   return (target && fromPath(target)) ?? null;
-});
+}
 
 /** A launcher script that runs the provider through mise (`exec mise x codex -- codex`). */
-const isMiseWrapperScript = Effect.fn("isMiseWrapperScript")(function* (
-  context: ProviderMaintenanceResolutionContext,
-) {
-  const fileSystem = yield* FileSystem.FileSystem;
-  const size = yield* fileSystem.stat(context.realCommandPath).pipe(
-    Effect.map((info) => Number(info.size)),
-    Effect.orElseSucceed(() => Infinity),
-  );
-  if (size > MISE_WRAPPER_MAX_BYTES) {
-    return false;
-  }
-  const script = yield* fileSystem
-    .readFileString(context.realCommandPath)
-    .pipe(Effect.orElseSucceed(() => ""));
-  return script.startsWith("#!") && /\bmise\s+(?:x|exec)\b/.test(script);
-});
+function isMiseWrapperScript(launcherScript: string): boolean {
+  return /\bmise\s+(?:x|exec)\b/.test(launcherScript);
+}
 
 /**
  * Volta's `bin/<cmd>` is a link to its `volta-shim`, which picks the package

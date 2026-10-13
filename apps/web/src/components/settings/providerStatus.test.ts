@@ -158,18 +158,28 @@ describe("provider status copy", () => {
 });
 
 describe("getProviderVersionAdvisoryPresentation for app-managed installs", () => {
-  it("explains the app updates it and offers no command", () => {
-    const presentation = getProviderVersionAdvisoryPresentation({
-      status: "unknown",
-      currentVersion: "0.162.0-alpha.17.2",
-      latestVersion: "0.162.1",
-      updateCommand: null,
-      canUpdate: false,
-      managedBy: "ChatGPT",
-      checkedAt: null,
-      message: "Updates with the ChatGPT app.",
-    });
-    expect(presentation?.title).toBe("Updates with the ChatGPT app");
+  const managed = {
+    status: "unknown",
+    currentVersion: "0.162.0-alpha.17.2",
+    latestVersion: null,
+    updateCommand: null,
+    canUpdate: false,
+    managedBy: "ChatGPT",
+    checkedAt: null,
+    message: "Updates with the ChatGPT app.",
+  } as const;
+
+  it("shows no update badge when there is nothing to act on", () => {
+    expect(getProviderVersionAdvisoryPresentation(managed)).toBeNull();
+  });
+
+  it("still surfaces compatibility warnings", () => {
+    const presentation = getProviderVersionAdvisoryPresentation(managed, {
+      status: "broken",
+      message: "This version is known broken.",
+      latestVersionStatus: "unknown",
+    } as never);
+    expect(presentation?.title).toBe("Known broken version");
     expect(presentation?.updateCommand).toBeNull();
   });
 });
