@@ -55,6 +55,25 @@ export const makeClaudeEnvironment = Effect.fn("makeClaudeEnvironment")(function
 });
 
 /**
+ * Whether an administrator installed Claude Code's `managed-mcp.json`. While it
+ * exists Claude refuses `--strict-mcp-config` and exits before initializing,
+ * but it already ignores user, project and `--mcp-config` servers on its own,
+ * so callers that pass the flag for isolation can drop it. Paths match the
+ * ones Claude Code checks.
+ */
+export const hasClaudeManagedMcpConfig = Effect.fn("hasClaudeManagedMcpConfig")(function* () {
+  const fileSystem = yield* FileSystem.FileSystem;
+  const platform = yield* HostProcess.Platform;
+  const managedMcpConfigPath =
+    platform === "darwin"
+      ? "/Library/Application Support/ClaudeCode/managed-mcp.json"
+      : platform === "win32"
+        ? "C:\\Program Files\\ClaudeCode\\managed-mcp.json"
+        : "/etc/claude-code/managed-mcp.json";
+  return yield* fileSystem.exists(managedMcpConfigPath).pipe(Effect.orElseSucceed(() => false));
+});
+
+/**
  * Instances can resume each other's sessions when Claude keeps their
  * transcripts in the same place. A config directory whose `projects` folder
  * links into another one (as `cswap run --share-history` profiles link into
