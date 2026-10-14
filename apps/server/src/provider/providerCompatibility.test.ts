@@ -139,6 +139,17 @@ describe("provider compatibility", () => {
     );
   });
 
+  it("labels this source build with the V2 release line that drives OpenCode 2", () => {
+    // Releases stamp their version at build time; source builds use the package.json
+    // version, which must sit on the V2 line because this code runs the V2 orchestrator.
+    const advisory = resolveProviderCompatibility(
+      ModelManifest.BUNDLED_MODEL_MANIFEST.compatibility,
+      ProviderDriverKind.make("opencode"),
+      "2.0.24",
+    );
+    assert.strictEqual(advisory?.status, "supported");
+  });
+
   it("compares Cursor build dates without treating semver prereleases as stable", () => {
     const cursor = ProviderDriverKind.make("cursor");
     const cursorPolicy: ProviderCompatibilityPolicy = {
